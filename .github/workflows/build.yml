@@ -36,7 +36,7 @@ jobs:
         include:
           - os: ubuntu-latest
             job-name: "Linux Tests"
-            gradle-tasks: "build ktlintCheck koverLog koverHtmlReport publishToMavenLocal -Pversion=1-SNAPSHOT"
+            gradle-tasks: "build ktlintCheck koverLog koverHtmlReport koverXmlReport publishToMavenLocal -Pversion=1-SNAPSHOT"
             max-workers: 3
 
           - os: windows-latest
@@ -88,7 +88,7 @@ jobs:
 
       - name: Upload Reports
         if: always()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: reports-build-${{ matrix.os }}
           path: |
@@ -107,6 +107,23 @@ jobs:
           report_paths: '**/test-results/**/TEST-*.xml'
           truncate_stack_traces: false
 
+      - name: Upload coverage reports to Codecov
+        if: ${{ !cancelled() && matrix.os == 'ubuntu-latest' }}
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          report_type: coverage
+          directory: ./build/reports/kover
+          files: report.xml
+
+      - name: Upload test results to Codecov
+        if: ${{ !cancelled() && matrix.os == 'ubuntu-latest' }}
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          report_type: test_results
+
+
       - name: Archive Maven Local Repository
         if: ${{ success() && matrix.os == 'ubuntu-latest' }}
         run: |
@@ -114,7 +131,7 @@ jobs:
 
       - name: Upload Maven Local Repository
         if: ${{ success() && matrix.os == 'ubuntu-latest' }}
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: local-maven-repository
           path: local-maven-repository.zip
@@ -163,6 +180,7 @@ jobs:
         sample:
           - kotlin-mcp-client
           - kotlin-mcp-server
+          - simple-streamable-server
           - weather-stdio-server
 
     name: "Build Sample: ${{ matrix.sample }}"
@@ -190,7 +208,7 @@ jobs:
             ../.konan/**
 
       - name: Download Maven Local Repository
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: local-maven-repository
           path: .
@@ -206,7 +224,7 @@ jobs:
 
       - name: Upload Reports
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: reports-samples-snapshot-${{ matrix.sample }}
           path: |

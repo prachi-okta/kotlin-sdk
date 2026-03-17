@@ -28,6 +28,7 @@ import io.modelcontextprotocol.kotlin.sdk.types.RPCError
 import io.modelcontextprotocol.kotlin.sdk.types.RPCError.ErrorCode.REQUEST_TIMEOUT
 import io.modelcontextprotocol.kotlin.sdk.types.RequestId
 import io.modelcontextprotocol.kotlin.sdk.types.SUPPORTED_PROTOCOL_VERSIONS
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.job
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -36,6 +37,8 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.decodeFromJsonElement
 import kotlin.concurrent.atomics.AtomicBoolean
 import kotlin.concurrent.atomics.ExperimentalAtomicApi
+import kotlin.time.Duration
+import kotlin.time.Duration.Companion.milliseconds
 import kotlin.uuid.ExperimentalUuidApi
 import kotlin.uuid.Uuid
 
@@ -43,11 +46,12 @@ internal const val MCP_SESSION_ID_HEADER = "mcp-session-id"
 private const val MCP_PROTOCOL_VERSION_HEADER = "mcp-protocol-version"
 private const val MCP_RESUMPTION_TOKEN_HEADER = "Last-Event-ID"
 private const val MAXIMUM_MESSAGE_SIZE = 4 * 1024 * 1024 // 4 MB
+private const val MIN_PRIMING_EVENT_PROTOCOL_VERSION = "2025-11-25"
 
 /**
  * A holder for an active request call.
- * If enableJsonResponse is true, session is null.
- * Otherwise, session is not null.
+ * If [StreamableHttpServerTransport.Configuration.enableJsonResponse] is true, the session is null.
+ * Otherwise, the session is not null.
  */
 private data class SessionContext(val session: ServerSSESession?, val call: ApplicationCall)
 
@@ -66,32 +70,87 @@ private data class SessionContext(val session: ServerSSESession?, val call: Appl
  * - No Session ID is included in any responses
  * - No session validation is performed
  *
- * @param enableJsonResponse If true, the server will return JSON responses instead of starting an SSE stream.
- *              This can be useful for simple request/response scenarios without streaming.
- *              Default is false (SSE streams are preferred).
- * @param enableDnsRebindingProtection Enable DNS rebinding protection
- *          (requires allowedHosts and/or allowedOrigins to be configured).
- *          Default is false for backwards compatibility.
- * @param allowedHosts List of allowed host header values for DNS rebinding protection.
- *          If not specified, host validation is disabled.
- * @param allowedOrigins List of allowed origin header values for DNS rebinding protection.
- *          If not specified, origin validation is disabled.
- * @param eventStore Event store for resumability support
- *          If provided, resumability will be enabled, allowing clients to reconnect and resume messages
- * @param retryIntervalMillis Retry interval (in milliseconds) advertised via SSE priming events
- *          to hint the client when to reconnect. Applies only when an [eventStore] is configured.
- *          Defaults to `null` (no retry hint).
+ * @param configuration Transport configuration. See [Configuration] for available options.
  */
 @OptIn(ExperimentalUuidApi::class, ExperimentalAtomicApi::class)
 @Suppress("TooManyFunctions")
-public class StreamableHttpServerTransport(
-    private val enableJsonResponse: Boolean = false,
-    private val enableDnsRebindingProtection: Boolean = false,
-    private val allowedHosts: List<String>? = null,
-    private val allowedOrigins: List<String>? = null,
-    private val eventStore: EventStore? = null,
-    private val retryIntervalMillis: Long? = null,
-) : AbstractTransport() {
+public class StreamableHttpServerTransport(private val configuration: Configuration) : AbstractTransport() {
+
+    @Deprecated("Use default constructor with explicit Configuration()")
+    public constructor() : this(configuration = Configuration())
+
+    /**
+     * Secondary constructor for `StreamableHttpServerTransport` that simplifies initialization by directly taking the
+     * configurable parameters without requiring a `Configuration` instance.
+     *
+     * @param enableJsonResponse Determines whether the server should return JSON responses.
+     *          Defaults to `false`.
+     * @param enableDnsRebindingProtection Enables DNS rebinding protection.
+     *          Defaults to `false`.
+     * @param allowedHosts A list of hosts allowed for server communication.
+     *          Defaults to `null`, allowing all hosts.
+     * @param allowedOrigins A list of allowed origins for CORS (Cross-Origin Resource Sharing).
+     *          Defaults to `null`, allowing all origins.
+     * @param eventStore The `EventStore` instance for handling resumable events.
+     *          Defaults to `null`, disabling resumability.
+     * @param retryIntervalMillis Retry interval in milliseconds for event handling or reconnection attempts.
+     *          Defaults to `null`.
+     */
+    @Suppress("MaxLineLength")
+    @Deprecated(
+        "Use constructor with Configuration: StreamableHttpServerTransport(Configuration(enableJsonResponse = ...))",
+        replaceWith = ReplaceWith(
+            "StreamableHttpServerTransport(Configuration(enableJsonResponse = enableJsonResponse, enableDnsRebindingProtection = enableDnsRebindingProtection, allowedHosts = allowedHosts, allowedOrigins = allowedOrigins, eventStore = eventStore, retryIntervalMillis = retryIntervalMillis))",
+        ),
+    )
+    public constructor(
+        enableJsonResponse: Boolean = false,
+        enableDnsRebindingProtection: Boolean = false,
+        allowedHosts: List<String>? = null,
+        allowedOrigins: List<String>? = null,
+        eventStore: EventStore? = null,
+        retryIntervalMillis: Long? = null,
+    ) : this(
+        Configuration(
+            enableJsonResponse = enableJsonResponse,
+            enableDnsRebindingProtection = enableDnsRebindingProtection,
+            allowedHosts = allowedHosts,
+            allowedOrigins = allowedOrigins,
+            eventStore = eventStore,
+            retryInterval = retryIntervalMillis?.milliseconds,
+        ),
+    )
+
+    /**
+     * Configuration for managing various aspects of the StreamableHttpServerTransport.
+     *
+     * @property enableJsonResponse Determines whether the server should return JSON responses.
+     *              Defaults to `false`.
+     *
+     * @property enableDnsRebindingProtection Enables DNS rebinding protection.
+     *              Defaults to `false`.
+     *
+     * @property allowedHosts A list of hosts allowed for server communication.
+     *              Defaults to `null`, allowing all hosts.
+     *
+     * @property allowedOrigins A list of allowed origins for CORS (Cross-Origin Resource Sharing).
+     *              Defaults to `null`, allowing all origins.
+     *
+     * @property eventStore The `EventStore` instance for handling resumable events.
+     *              Defaults to `null`, disabling resumability.
+     *
+     * @property retryInterval Retry interval for event handling or reconnection attempts.
+     *              Defaults to `null`.
+     */
+    public class Configuration(
+        public val enableJsonResponse: Boolean = false,
+        public val enableDnsRebindingProtection: Boolean = false,
+        public val allowedHosts: List<String>? = null,
+        public val allowedOrigins: List<String>? = null,
+        public val eventStore: EventStore? = null,
+        public val retryInterval: Duration? = null,
+    )
+
     public var sessionId: String? = null
         private set
 
@@ -177,14 +236,22 @@ public class StreamableHttpServerTransport(
             ?: error("No connection established for request id $routingRequestId")
         val activeStream = streamsMapping[streamId]
 
-        if (!enableJsonResponse) {
+        if (!configuration.enableJsonResponse) {
             activeStream?.let { stream ->
                 emitOnStream(streamId, stream.session, message)
             }
         }
 
         val isTerminated = message is JSONRPCResponse || message is JSONRPCError
-        if (!isTerminated) return
+        if (!isTerminated) {
+            if (configuration.enableJsonResponse) {
+                // In JSON response mode there is no per-request SSE stream, so route notifications
+                // that are logically associated with a request to the standalone GET SSE stream.
+                val standaloneStream = streamsMapping[STANDALONE_SSE_STREAM_ID]
+                standaloneStream?.let { emitOnStream(STANDALONE_SSE_STREAM_ID, it.session, message) }
+            }
+            return
+        }
 
         requestToResponseMapping[responseRequestId!!] = message
         val relatedIds = requestToStreamMapping.filterValues { it == streamId }.keys
@@ -194,7 +261,7 @@ public class StreamableHttpServerTransport(
         streamMutex.withLock {
             if (activeStream == null) error("No connection established for request ID: $routingRequestId")
 
-            if (enableJsonResponse) {
+            if (configuration.enableJsonResponse) {
                 activeStream.call.response.header(HttpHeaders.ContentType, ContentType.Application.Json.toString())
                 sessionId?.let { activeStream.call.response.header(MCP_SESSION_ID_HEADER, it) }
                 val responses = relatedIds.mapNotNull { requestToResponseMapping[it] }
@@ -261,7 +328,7 @@ public class StreamableHttpServerTransport(
     @Suppress("CyclomaticComplexMethod", "LongMethod", "ReturnCount", "TooGenericExceptionCaught")
     public suspend fun handlePostRequest(session: ServerSSESession?, call: ApplicationCall) {
         try {
-            if (!enableJsonResponse && session == null) {
+            if (!configuration.enableJsonResponse && session == null) {
                 error("Server session can't be null for SSE responses")
             }
 
@@ -328,10 +395,10 @@ public class StreamableHttpServerTransport(
             }
 
             val streamId = Uuid.random().toString()
-            if (!enableJsonResponse) {
+            if (!configuration.enableJsonResponse) {
                 call.appendSseHeaders()
                 flushSse(session) // flush headers immediately
-                maybeSendPrimingEvent(streamId, session)
+                maybeSendPrimingEvent(streamId, session, call.request.header(MCP_PROTOCOL_VERSION_HEADER))
             }
 
             streamMutex.withLock {
@@ -353,14 +420,9 @@ public class StreamableHttpServerTransport(
 
     @Suppress("ReturnCount")
     public suspend fun handleGetRequest(session: ServerSSESession?, call: ApplicationCall) {
-        if (enableJsonResponse) {
-            call.reject(
-                HttpStatusCode.MethodNotAllowed,
-                RPCError.ErrorCode.CONNECTION_CLOSED,
-                "Method not allowed.",
-            )
-            return
-        }
+        // NOTE: enableJsonResponse only controls how POST responses are delivered (JSON vs. SSE).
+        // The standalone GET SSE stream is always supported — it is the only channel available
+        // for server-to-client notifications when enableJsonResponse = true.
         val sseSession = session ?: error("Server session can't be null for streaming GET requests")
 
         val acceptHeader = call.request.header(HttpHeaders.Accept)
@@ -375,7 +437,7 @@ public class StreamableHttpServerTransport(
 
         if (!validateSession(call) || !validateProtocolVersion(call)) return
 
-        eventStore?.let { store ->
+        configuration.eventStore?.let { store ->
             call.request.header(MCP_RESUMPTION_TOKEN_HEADER)?.let { lastEventId ->
                 replayEvents(store, lastEventId, sseSession)
                 return
@@ -394,10 +456,13 @@ public class StreamableHttpServerTransport(
         call.appendSseHeaders()
         flushSse(sseSession) // flush headers immediately
         streamsMapping[STANDALONE_SSE_STREAM_ID] = SessionContext(sseSession, call)
-        maybeSendPrimingEvent(STANDALONE_SSE_STREAM_ID, sseSession)
+        maybeSendPrimingEvent(STANDALONE_SSE_STREAM_ID, sseSession, call.request.header(MCP_PROTOCOL_VERSION_HEADER))
         sseSession.coroutineContext.job.invokeOnCompletion {
             streamsMapping.remove(STANDALONE_SSE_STREAM_ID)
         }
+        // Keep the SSE connection open until the client disconnects or the transport is closed.
+        // Without this, the Ktor sse{} handler returns immediately, closing the stream.
+        awaitCancellation()
     }
 
     public suspend fun handleDeleteRequest(call: ApplicationCall) {
@@ -413,7 +478,7 @@ public class StreamableHttpServerTransport(
      */
     @Suppress("ReturnCount", "TooGenericExceptionCaught")
     public suspend fun closeSseStream(requestId: RequestId) {
-        if (enableJsonResponse) return
+        if (configuration.enableJsonResponse) return
         val streamId = requestToStreamMapping[requestId] ?: return
         val sessionContext = streamsMapping[streamId] ?: return
 
@@ -562,9 +627,9 @@ public class StreamableHttpServerTransport(
 
     @Suppress("ReturnCount")
     private fun validateHeaders(call: ApplicationCall): String? {
-        if (!enableDnsRebindingProtection) return null
+        if (!configuration.enableDnsRebindingProtection) return null
 
-        allowedHosts?.let { hosts ->
+        configuration.allowedHosts?.let { hosts ->
             val hostHeader = call.request.headers[HttpHeaders.Host]?.lowercase()
             val allowedHostsLowercase = hosts.map { it.lowercase() }
 
@@ -573,7 +638,7 @@ public class StreamableHttpServerTransport(
             }
         }
 
-        allowedOrigins?.let { origins ->
+        configuration.allowedOrigins?.let { origins ->
             val originHeader = call.request.headers[HttpHeaders.Origin]?.lowercase()
             val allowedOriginsLowercase = origins.map { it.lowercase() }
 
@@ -636,7 +701,7 @@ public class StreamableHttpServerTransport(
         this?.lowercase()?.contains(mime.toString().lowercase()) == true
 
     private suspend fun emitOnStream(streamId: String, session: ServerSSESession?, message: JSONRPCMessage) {
-        val eventId = eventStore?.storeEvent(streamId, message)
+        val eventId = configuration.eventStore?.storeEvent(streamId, message)
         try {
             session?.send(event = "message", id = eventId, data = McpJson.encodeToString(message))
         } catch (_: Exception) {
@@ -645,12 +710,24 @@ public class StreamableHttpServerTransport(
     }
 
     @Suppress("TooGenericExceptionCaught")
-    private suspend fun maybeSendPrimingEvent(streamId: String, session: ServerSSESession?) {
-        val store = eventStore ?: return
-        val sseSession = session ?: return
+    private suspend fun maybeSendPrimingEvent(
+        streamId: String,
+        session: ServerSSESession?,
+        clientProtocolVersion: String? = null,
+    ) {
+        val store = configuration.eventStore
+        if (store == null || session == null) return
+        // Priming events have empty data which older clients cannot handle.
+        // Only send priming events to clients with protocol version >= 2025-11-25
+        // which includes the fix for handling empty SSE data.
+        if (clientProtocolVersion != null && clientProtocolVersion < MIN_PRIMING_EVENT_PROTOCOL_VERSION) return
         try {
             val primingEventId = store.storeEvent(streamId, JSONRPCEmptyMessage)
-            sseSession.send(id = primingEventId, retry = retryIntervalMillis, data = "")
+            session.send(
+                id = primingEventId,
+                retry = configuration.retryInterval?.inWholeMilliseconds,
+                data = "",
+            )
         } catch (e: Exception) {
             _onError(e)
         }
